@@ -86,7 +86,7 @@ extension OmniPumpManagerError: LocalizedError {
 public class OmniPumpManager: RileyLinkPumpManager {
 
     public var inSignalLoss: Bool {
-        isSignalLost(at: Date(), lastPumpDataReportDate: state.lastPumpDataReportDate)
+        isSignalLost(at: Date(), lastPodUpdate: state.podState?.podTimeUpdated)
     }
 
     public var isInoperable: Bool {
@@ -288,6 +288,12 @@ public class OmniPumpManager: RileyLinkPumpManager {
             }
         }
 
+        // Once the delegate has been asked to remove this pump manager, a late state write (e.g. from
+        // an async RileyLink disconnect) must not reach it, or the host may re-adopt this manager.
+        guard !lockedIsDeactivating.value else {
+            return returnType
+        }
+
         // Ideally we ensure that oldValue.rawValue != newValue.rawValue, but the types aren't
         // defined as equatable
         pumpDelegate.notify { (delegate) in
@@ -302,6 +308,8 @@ public class OmniPumpManager: RileyLinkPumpManager {
     }
 
     private let lockedState: Locked<OmniPumpManagerState>
+
+    private let lockedIsDeactivating = Locked(false)
 
     private let statusObservers = WeakSynchronizedSet<PumpManagerStatusObserver>()
 
@@ -345,8 +353,8 @@ public class OmniPumpManager: RileyLinkPumpManager {
         let rileyLinkIsInUse = self.state.podType.isEros || self.state.podKeepAlive == .rileyLink
         if rileyLinkIsInUse {
             rileyLinkDeviceProvider.timerTickEnabled =
-                self.state.isPumpDataStale || mustProvide || /// RL ticks needed for traditional BLE wakups
-                self.state.podKeepAlive == .rileyLink // RL ticks needed for PodKeepAlive rileyLink option
+                self.state.isPumpDataStale || mustProvide || /// RL ticks needed for traditional BLE wakeups
+                self.state.podKeepAlive == .rileyLink /// RL ticks needed for PodKeepAlive rileyLink option
         } else {
             provideHeartbeat = mustProvide
             // BLE pod: when the host needs us to provide the heartbeat (e.g. a CGM that can't), run the
@@ -595,7 +603,7 @@ extension OmniPumpManager {
             return HKDevice(
                 name: pluginIdentifier,
                 manufacturer: "Insulet",
-                model: state.podType.description,
+                model: state.podType.modelName,
                 hardwareVersion: String(state.podType.rawValue),
                 firmwareVersion: podState.firmwareVersion + " " + podState.iFirmwareVersion,
                 softwareVersion: String(OmnipodKitVersionNumber),
@@ -606,7 +614,7 @@ extension OmniPumpManager {
             return HKDevice(
                 name: pluginIdentifier,
                 manufacturer: "Insulet",
-                model: state.podType.description,
+                model: state.podType.modelName,
                 hardwareVersion: nil,
                 firmwareVersion: nil,
                 softwareVersion: String(OmnipodKitVersionNumber),
@@ -998,7 +1006,7 @@ extension OmniPumpManager {
                     localizedMessage: LocalizedString("Insulin Suspended", comment: "Status highlight that insulin delivery was suspended."),
                     imageName: "pause.circle.fill",
                     state: .warning)
-            } else if isSignalLost(at: date, lastPumpDataReportDate: state.lastPumpDataReportDate) {
+            } else if isSignalLost(at: date, lastPodUpdate: state.podState?.podTimeUpdated) {
                 return PumpStatusHighlight(
                     localizedMessage: LocalizedString("Signal Loss", comment: "Status highlight when communications with the pod haven't happened recently."),
                     imageName: "exclamationmark.circle.fill",
@@ -1013,8 +1021,10 @@ extension OmniPumpManager {
         }
     }
 
-    private func isSignalLost(at date: Date, lastPumpDataReportDate: Date?) -> Bool {
-        date.timeIntervalSince(lastPumpDataReportDate ?? .distantPast) > .minutes(12)
+    /// Signal loss is defined as not having seen a pod response in over 12 minutes.
+    private func isSignalLost(at date: Date, lastPodUpdate: Date?) -> Bool {
+        let timeSinceLastResponse = date.timeIntervalSince(lastPodUpdate ?? .distantPast)
+        return timeSinceLastResponse > .minutes(12)
     }
 
     func isRunningManualTempBasal(for state: OmniPumpManagerState) -> Bool {
@@ -1090,12 +1100,7 @@ extension OmniPumpManager {
                 return
             }
 
-            if state.podType.isEros || state.podKeepAlive == .rileyLink {
-                /// Switching away from using RileyLinks, disconnect the devices
-                disconnectRileyLinkDevices()
-            }
-
-            forgetBluetoothManager()
+            forgetBluetoothConnections()
 
             let podComms: PodComms
             switch newValue {
@@ -1272,9 +1277,19 @@ extension OmniPumpManager {
         }
     }
 
-    // If applicable forget the BluetoothManager for current podComms
-    // to avoid future "Bluetooth use unsupported on this device" errors.
-    func forgetBluetoothManager() {
+    // Stop using OmnipodKit altogether: release Bluetooth and any RileyLinks, then ask the delegate to remove us.
+    func stopUsing(completion: @escaping () -> Void) {
+        lockedIsDeactivating.value = true
+        forgetBluetoothConnections()
+        notifyDelegateOfDeactivation(completion: completion)
+    }
+
+    /// Forget all Bluetooth connections. For BLE pods call
+    /// blePodComms.forgetBluetoothManager() to avoid future
+    /// "Bluetooth use unsupported on this device" errors.
+    /// For Eros pods or if using Pod Keep Alive RileyLink mode,
+    /// call disconnectRileyLinkDevices() to release the RLs.
+    func forgetBluetoothConnections() {
         if let blePodComms = self.lockedPodComms.value as? BlePodComms {
             blePodComms.forgetBluetoothManager()
         }
@@ -1285,6 +1300,17 @@ extension OmniPumpManager {
 
 
     // MARK: Testing
+
+    /// The simulator has no Bluetooth, so pod commands are mocked there,
+    /// unless a CoreBluetooth bridge (ImpossiBLE, serving the pod simulator)
+    /// gives a BLE pod one to talk to. Nothing simulates a RileyLink.
+    var mocksPod: Bool {
+        #if targetEnvironment(simulator)
+        return state.podType.isEros || NSClassFromString("CBSPeripheral") == nil
+        #else
+        return false
+        #endif
+    }
 
     #if targetEnvironment(simulator)
     private func jumpStartPod(address: UInt32, lotNo: UInt32, lotSeq: UInt32, fault: DetailedStatus? = nil, startDate: Date? = nil, mockFault: Bool) {
@@ -1339,34 +1365,37 @@ extension OmniPumpManager {
         }
 
         #if targetEnvironment(simulator)
-        // If we're in the simulator, create a mock PodState
-        let mockFaultDuringPairing = false
-        let mockCommsErrorDuringPairing = false
-        let mockStartDate = Date()
-        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + .seconds(2)) {
-            if self.state.podType.isEros {
-                let address: UInt32 = self.state.podState?.address ?? 0x1f1f1f1f
-                self.jumpStartPod(address: address, lotNo: 135601809, lotSeq: 0800525, startDate: mockStartDate, mockFault: mockFaultDuringPairing)
-            } else {
-                let address: UInt32 = self.state.podState?.address ?? 0x17171717
-                self.jumpStartPod(address: address, lotNo: 135601809, lotSeq: 0800525, startDate: mockStartDate, mockFault: mockFaultDuringPairing)
+        if self.mocksPod {
+            // If we're in the simulator, create a mock PodState
+            let mockFaultDuringPairing = false
+            let mockCommsErrorDuringPairing = false
+            let mockStartDate = Date()
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + .seconds(2)) {
+                if self.state.podType.isEros {
+                    let address: UInt32 = self.state.podState?.address ?? 0x1f1f1f1f
+                    self.jumpStartPod(address: address, lotNo: 135601809, lotSeq: 0800525, startDate: mockStartDate, mockFault: mockFaultDuringPairing)
+                } else {
+                    let address: UInt32 = self.state.podState?.address ?? 0x17171717
+                    self.jumpStartPod(address: address, lotNo: 135601809, lotSeq: 0800525, startDate: mockStartDate, mockFault: mockFaultDuringPairing)
+                }
+                let fault: DetailedStatus? = self.setStateWithResult({ (state) in
+                    var podState = state.podState
+                    podState?.setupProgress = .priming
+                    state.updatePodStateFromPodComms(podState)
+                    return state.podState?.fault
+                })
+                if let fault = fault {
+                    completion(.failure(PumpManagerError.deviceState(PodCommsError.podFault(fault: fault))))
+                } else if mockCommsErrorDuringPairing {
+                    completion(.failure(PumpManagerError.communication(PodCommsError.noResponse)))
+                } else {
+                    let mockPrimeDuration = TimeInterval(.seconds(3))
+                    completion(.success(mockPrimeDuration))
+                }
             }
-            let fault: DetailedStatus? = self.setStateWithResult({ (state) in
-                var podState = state.podState
-                podState?.setupProgress = .priming
-                state.updatePodStateFromPodComms(podState)
-                return state.podState?.fault
-            })
-            if let fault = fault {
-                completion(.failure(PumpManagerError.deviceState(PodCommsError.podFault(fault: fault))))
-            } else if mockCommsErrorDuringPairing {
-                completion(.failure(PumpManagerError.communication(PodCommsError.noResponse)))
-            } else {
-                let mockPrimeDuration = TimeInterval(.seconds(3))
-                completion(.success(mockPrimeDuration))
-            }
+            return
         }
-        #else
+        #endif
 
         /// Calls the completion handler for a failure with an appropriate PumpManagerError value
         func completionFailure(_ error: LocalizedError?) {
@@ -1524,35 +1553,37 @@ extension OmniPumpManager {
                 primeSession(result)
             }
         }
-        #endif
     }
 
     // Called on the main thread
     func insertCannula(completion: @escaping (Result<TimeInterval,OmniPumpManagerError>) -> Void) {
         
         #if targetEnvironment(simulator)
-        let mockDelay = TimeInterval(seconds: 3)
-        let mockFaultDuringInsertCannula = false
-        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + mockDelay) {
-            let result = self.setStateWithResult({ (state) -> Result<TimeInterval,OmniPumpManagerError> in
-                if mockFaultDuringInsertCannula {
-                    let fault = try! DetailedStatus(encodedData: Data(hexadecimalString: "020d0000000e00c36a020703ff020900002899080082")!)
+        if self.mocksPod {
+            let mockDelay = TimeInterval(seconds: 3)
+            let mockFaultDuringInsertCannula = false
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + mockDelay) {
+                let result = self.setStateWithResult({ (state) -> Result<TimeInterval,OmniPumpManagerError> in
+                    if mockFaultDuringInsertCannula {
+                        let fault = try! DetailedStatus(encodedData: Data(hexadecimalString: "020d0000000e00c36a020703ff020900002899080082")!)
+                        var podState = state.podState
+                        podState?.fault = fault
+                        state.updatePodStateFromPodComms(podState)
+                        return .failure(OmniPumpManagerError.communication(PodCommsError.podFault(fault: fault)))
+                    }
+
+                    // Mock success
                     var podState = state.podState
-                    podState?.fault = fault
+                    podState?.setupProgress = .completed
                     state.updatePodStateFromPodComms(podState)
-                    return .failure(OmniPumpManagerError.communication(PodCommsError.podFault(fault: fault)))
-                }
+                    return .success(mockDelay)
+                })
 
-                // Mock success
-                var podState = state.podState
-                podState?.setupProgress = .completed
-                state.updatePodStateFromPodComms(podState)
-                return .success(mockDelay)
-            })
-
-            completion(result)
+                completion(result)
+            }
+            return
         }
-        #else
+        #endif
         let preError = setStateWithResult({ (state) -> OmniPumpManagerError? in
             guard let podState = state.podState, podState.readyForCannulaInsertion else
             {
@@ -1619,13 +1650,15 @@ extension OmniPumpManager {
                 completion(.failure(.communication(error)))
             }
         }
-        #endif
     }
 
     func checkCannulaInsertionFinished(completion: @escaping (OmniPumpManagerError?) -> Void) {
 #if targetEnvironment(simulator)
-        completion(nil)
-#else
+        if self.mocksPod {
+            completion(nil)
+            return
+        }
+#endif
         self.runSession(withName: "Check cannula insertion finished") { (result) in
             switch result {
             case .success(let session):
@@ -1641,7 +1674,6 @@ extension OmniPumpManager {
                 completion(.communication(error))
             }
         }
-#endif
     }
 
     // Called when resuming a pod setup operation which sometimes can fail on the first pod command in various situations.
@@ -1848,12 +1880,15 @@ extension OmniPumpManager {
 
         let timeZone = TimeZone.currentFixed
 #if targetEnvironment(simulator)
-        // Just update the pump manager state
-        self.setState { (state) in
-            state.timeZone = timeZone
+        if self.mocksPod {
+            // Just update the pump manager state
+            self.setState { (state) in
+                state.timeZone = timeZone
+            }
+            completion(nil)
+            return
         }
-        completion(nil)
-#else
+#endif
         // Just update the pump manager state if there is no active Pod
         guard self.hasActivePod else {
             self.setState { (state) in
@@ -1894,7 +1929,6 @@ extension OmniPumpManager {
                 completion(.communication(error))
             }
         }
-#endif
     }
 
     func setBasalSchedule(_ schedule: BasalSchedule, completion: @escaping (Error?) -> Void) {
@@ -1974,10 +2008,13 @@ extension OmniPumpManager {
     // it does not handle concurrent calls.
     func deactivatePod(completion: @escaping (OmniPumpManagerError?) -> Void) {
         #if targetEnvironment(simulator)
-        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + .seconds(2)) {
-            completion(nil)
+        if self.mocksPod {
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + .seconds(2)) {
+                completion(nil)
+            }
+            return
         }
-        #else
+        #endif
         guard self.state.podState != nil else {
             completion(OmniPumpManagerError.noPodPaired)
             return
@@ -1996,7 +2033,6 @@ extension OmniPumpManager {
                 completion(OmniPumpManagerError.communication(error))
             }
         }
-        #endif
     }
 
     func playTestBeeps() async throws {
@@ -2174,12 +2210,8 @@ extension OmniPumpManager {
 
     func setConfirmationBeeps(newPreference: BeepPreference, completion: @escaping (OmniPumpManagerError?) -> Void) {
 
-        #if targetEnvironment(simulator)
-        let justUpdateState = true
-        #else
         // Just update the pump manager state if there is no active Pod or if currently silenced
-        let justUpdateState = !state.hasActivePod || state.silencePod
-        #endif
+        let justUpdateState = self.mocksPod || !state.hasActivePod || state.silencePod
 
         let name = String(format: "Set Beep Preference to %@", String(describing: newPreference))
         if justUpdateState {
@@ -2256,13 +2288,9 @@ extension OmniPumpManager {
             return
         }
 
-        #if targetEnvironment(simulator)
-        let justUpdateState = true
-        #else
         // Just update the pump manager state if there is no active Pod
         // or if the Silence Pod state will not be changing.
-        let justUpdateState = !self.hasActivePod || state.silencePod == silencePod
-        #endif
+        let justUpdateState = self.mocksPod || !self.hasActivePod || state.silencePod == silencePod
 
         let name = String(format: "%@ Pod", silencePod ? "Silence" : "Unsilence")
         if justUpdateState {
@@ -2367,10 +2395,12 @@ extension OmniPumpManager {
     }
 
     // A host asked the pump to provide the BLE heartbeat on a combination needing the eager-connect
-    // mitigation. The usual StartDelay probe can't be used there, so wakes are driven by link drops
-    // instead (see BluetoothManager.isEagerHeartbeatMode) — workable, but less regular.
+    // mitigation, while a Pod Keep Alive mode holds the pod connected in the background. The usual
+    // StartDelay probe can't be used there, so wakes are driven by link drops instead
+    // (see BluetoothManager.isEagerHeartbeatMode) — workable, but less regular.
     var bleHeartbeatDegradedForThisPod: Bool {
-        guard usingInPlayPod == true, UIDevice.hasPossibleInPlayBLEIssues else { return false }
+        guard usingInPlayPod == true, UIDevice.hasPossibleInPlayBLEIssues,
+              state.podKeepAlive.keepsPodConnectedInBackground else { return false }
         if let blePodComms = podComms as? BlePodComms {
             return blePodComms.isBLEHeartbeatRequested
         }
@@ -3260,15 +3290,24 @@ extension OmniPumpManager: PumpManager {
         }
     }
 
-    private func acknowledgeAlertSlots(_ slots: AlertSet) async throws {
+    private func acknowledgeAlertSlots(_ slots: AlertSet, for alert: PumpManagerAlert) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) -> Void in
             self.runSession(withName: "Acknowledge Alert") { (result) in
                 switch result {
                 case .success(let session):
                     self.handleSilencePodEnd(session: session)
+
+                    // A retry from silenceAcknowledgedAlerts may have cleared it already
+                    guard self.state.alertsWithPendingAcknowledgment.contains(alert) else {
+                        continuation.resume()
+                        return
+                    }
                     do {
                         let beepBlock = self.beepMessageBlock(beepType: .beep)
                         let _ = try session.acknowledgeAlerts(alerts: slots, beepBlock: beepBlock)
+                        self.setState { state in
+                            state.alertsWithPendingAcknowledgment.remove(alert)
+                        }
                         continuation.resume()
                     } catch {
                         continuation.resume(throwing: error)
@@ -3309,6 +3348,10 @@ extension OmniPumpManager: PumpManager {
                 self.runSession(withName: "Silence already acknowledged alert") { (result) in
                     switch result {
                     case .success(let session):
+                        // Another queued session may have cleared it already
+                        guard self.state.alertsWithPendingAcknowledgment.contains(alert) else {
+                            return
+                        }
                         do {
                             let _ = try session.acknowledgeAlerts(alerts: AlertSet(slots: [slot]))
                         } catch {
@@ -3524,20 +3567,20 @@ extension OmniPumpManager {
                     let clearsExpirationReminder = self.expiryAlertSupersedesReminder(alert)
                     let slots = AlertSet(slots: clearsExpirationReminder ? [slot, .slot3ExpirationReminder] : [slot])
 
+                    // Loop records the acknowledgement as soon as it is tapped. Persist it here too, before
+                    // the session runs, so that if the app dies while waiting on the pod the next status
+                    // update still clears the pod alert (see silenceAcknowledgedAlerts).
+                    self.setState { state in
+                        state.alertsWithPendingAcknowledgment.insert(alert)
+                    }
+
                     do {
-                        try await self.acknowledgeAlertSlots(slots)
+                        try await self.acknowledgeAlertSlots(slots, for: alert)
                     } catch {
                         // A link that drops mid-command fails the first attempt, and a fresh session usually
                         // succeeds. Retry once before reporting a failure the user can't act on.
                         log.default("Acknowledging %{public}@ failed, retrying once: %{public}@", String(describing: slots), String(describing: error))
-                        do {
-                            try await self.acknowledgeAlertSlots(slots)
-                        } catch {
-                            self.setState { state in
-                                state.alertsWithPendingAcknowledgment.insert(alert)
-                            }
-                            throw error
-                        }
+                        try await self.acknowledgeAlertSlots(slots, for: alert)
                     }
                     self.setState { state in
                         state.activeAlerts.remove(alert)

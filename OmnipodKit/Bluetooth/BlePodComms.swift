@@ -69,14 +69,18 @@ class BlePodComms: PodComms {
     // "Bluetooth use unsupported on this device" errors on the
     // next BlePodComms instantiation and subsequent usage.
     func forgetBluetoothManager() {
-        bluetoothManager.connectionDelegate = nil
-        bluetoothManager = nil
+        if bluetoothManager != nil {
+            bluetoothManager.connectionDelegate = nil
+            bluetoothManager = nil
+        }
     }
 
     /// Sets bluetoothManager's podKeepAlive value to drive the pod connection policy.
     func setPodKeepAliveKeepsConnectedInBackground(_ keepConnectedInBackground: Bool) {
-        print("@@@ setting bluetoothManager.podKeepAliveKeepsConnectedInBackground to \(keepConnectedInBackground)")
-        bluetoothManager.podKeepAliveKeepsConnectedInBackground = keepConnectedInBackground
+        if bluetoothManager != nil {
+            print("@@@ setting bluetoothManager.podKeepAliveKeepsConnectedInBackground to \(keepConnectedInBackground)")
+            bluetoothManager.podKeepAliveKeepsConnectedInBackground = keepConnectedInBackground
+        }
     }
 
     func connectToNewPod(_ completion: @escaping (Result<Omni, Error>) -> Void) {
@@ -339,6 +343,7 @@ class BlePodComms: PodComms {
                 throw PodCommsError.diagnosticMessage(str: "Received resynchronization SQN for the second time")
             }
         }
+        needsSessionEstablishment = false
     }
 
     /// Handles executing the required O5 AID setup commands and updates the podState's transport state as needed.
@@ -693,6 +698,12 @@ class BlePodComms: PodComms {
                 return
             }
 
+            guard !(self.hasLTK && self.needsSessionEstablishment) else {
+                self.log.error("Session '%{public}@' refused: no session established on this connection", name)
+                block(.failure(PodCommsError.podNotConnected))
+                return
+            }
+
             let transport = BlePodMessageTransport(manager: manager, myId: self.myId, podId: self.podId, state: self.podState!.bleMessageTransportState, signingKey: self.podState!.signingKey)
             transport.messageLogger = self.messageLogger
 
@@ -803,6 +814,7 @@ extension BlePodComms: PeripheralManagerDelegate {
                 needsSessionEstablishment = false
                 delegate?.podCommsDidEstablishSession(self)
             } catch {
+                omnipodLogDeviceEvent("[CONFIG] session handshake FAILED: \(error)")
                 log.error("Pod session sync error: %{public}@", String(describing: error))
             }
 
